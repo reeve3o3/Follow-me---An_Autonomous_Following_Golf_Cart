@@ -1,0 +1,729 @@
+import serial
+import time
+import threading
+import RPi.GPIO as GPIO
+import logging
+import numpy as np
+from collections import deque
+import math
+
+# 設定日誌
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class PredictiveController:
+    """預測控制器 - 補償UWB延遲和防止轉向過度"""
+    
+    def __init__(self):
+        # 狀態歷史記錄
+        self.angle_history = deque(maxlen=10)
+        self.time_history = deque(maxlen=10)
+        self.distance_history = deque(maxlen=5)
+        
+        # 運動預測參數
+        self.max_prediction_time = 0.5  # 最大預測時間(秒)
+        self.convergence_threshold = 2.0  # 收斂閾值(度/秒)
+        
+        # 延遲補償參數
+        self.estimated_delay = 0.2  # 估計的系統延遲(秒)
+        self.delay_history = deque(maxlen=5)
+        
+        # 控制抑制參數
+        self.overshoot_factor = 0.7  # 防止過度轉向的抑制因子
+        self.smoothing_factor = 0.3  # 平滑因子
+        
+    def add_measurement(self, angle, distance, timestamp):
+        """添加新的測量數據"""
+        self.angle_history.append(angle)
+        self.time_history.append(timestamp)
+        self.distance_history.append(distance)
+        
+        # 動態估計系統延遲
+        self._estimate_delay()
+    
+    def _estimate_delay(self):
+        """動態估計系統延遲"""
+        if len(self.time_history) >= 2:
+            # 計算數據間隔，估計延遲
+            intervals = []
+            for i in range(1, len(self.time_history)):
+                interval = self.time_history[i] - self.time_history[i-1]
+                intervals.append(interval)
+            
+            if intervals:
+                avg_interval = np.mean(intervals)
+                # 延遲估計為平均間隔的1.5倍
+                estimated_delay = min(avg_interval * 1.5, 0.5)
+                self.delay_history.append(estimated_delay)
+                
+                if len(self.delay_history) >= 3:
+                    self.estimated_delay = np.mean(list(self.delay_history))
+    
+    def calculate_angular_velocity(self):
+        """計算角速度"""
+        if len(self.angle_history) < 2:
+            return 0.0
+        
+        # 使用最近的幾個點計算角速度
+        angles = list(self.angle_history)[-3:]
+        times = list(self.time_history)[-3:]
+        
+        if len(angles) < 2:
+            return 0.0
+        
+        # 線性回歸計算角速度
+        velocities = []
+        for i in range(1, len(angles)):
+            dt = times[i] - times[i-1]
+            if dt > 0:
+                dangle = angles[i] - angles[i-1]
+                # 處理角度跨越
+                if dangle > 90:
+                    dangle -= 180
+                elif dangle < -90:
+                    dangle += 180
+                velocities.append(dangle / dt)
+        
+        return np.mean(velocities) if velocities else 0.0
+    
+    def calculate_angular_acceleration(self):
+        """計算角加速度"""
+        if len(self.angle_history) < 3:
+            return 0.0
+        
+        angles = list(self.angle_history)[-4:]
+        times = list(self.time_history)[-4:]
+        
+        if len(angles) < 3:
+            return 0.0
+        
+        # 計算連續的角速度
+        velocities = []
+        vel_times = []
+        for i in range(1, len(angles)):
+            dt = times[i] - times[i-1]
+            if dt > 0:
+                dangle = angles[i] - angles[i-1]
+                if dangle > 90:
+                    dangle -= 180
+                elif dangle < -90:
+                    dangle += 180
+                velocities.append(dangle / dt)
+                vel_times.append((times[i] + times[i-1]) / 2)
+        
+        if len(velocities) < 2:
+            return 0.0
+        
+        # 計算角加速度
+        accelerations = []
+        for i in range(1, len(velocities)):
+            dt = vel_times[i] - vel_times[i-1]
+            if dt > 0:
+                dvel = velocities[i] - velocities[i-1]
+                accelerations.append(dvel / dt)
+        
+        return np.mean(accelerations) if accelerations else 0.0
+    
+    def predict_future_angle(self, prediction_time=None):
+        """預測未來角度"""
+        if not self.angle_history:
+            return 0.0
+        
+        current_angle = self.angle_history[-1]
+        angular_velocity = self.calculate_angular_velocity()
+        angular_acceleration = self.calculate_angular_acceleration()
+        
+        if prediction_time is None:
+            prediction_time = self.estimated_delay
+        
+        # 限制預測時間
+        prediction_time = min(prediction_time, self.max_prediction_time)
+        
+        # 使用二次方程預測: angle = current + vel*t + 0.5*acc*t^2
+        predicted_angle = (current_angle + 
+                          angular_velocity * prediction_time + 
+                          0.5 * angular_acceleration * prediction_time**2)
+        
+        # 正規化角度
+        while predicted_angle > 90:
+            predicted_angle -= 180
+        while predicted_angle < -90:
+            predicted_angle += 180
+        
+        logger.debug(f"預測: 當前角度={current_angle:.2f}°, "
+                    f"角速度={angular_velocity:.2f}°/s, "
+                    f"預測角度={predicted_angle:.2f}°")
+        
+        return predicted_angle
+    
+    def detect_convergence(self):
+        """檢測是否正在收斂到目標"""
+        angular_velocity = self.calculate_angular_velocity()
+        
+        if len(self.angle_history) < 3:
+            return False
+        
+        current_angle = self.angle_history[-1]
+        
+        # 如果角速度很小且角度誤差在減小，認為正在收斂
+        if abs(angular_velocity) < self.convergence_threshold:
+            # 檢查角度是否在減小
+            recent_angles = list(self.angle_history)[-3:]
+            angle_magnitudes = [abs(angle) for angle in recent_angles]
+            
+            if len(angle_magnitudes) >= 2:
+                is_decreasing = angle_magnitudes[-1] < angle_magnitudes[0]
+                return is_decreasing and abs(current_angle) < 30
+        
+        return False
+    
+    def calculate_control_factor(self, current_angle, distance):
+        """計算控制因子，防止過度轉向"""
+        # 基礎控制因子
+        control_factor = 1.0
+        
+        # 1. 收斂檢測 - 如果正在收斂，減少控制強度
+        if self.detect_convergence():
+            control_factor *= 0.5
+            logger.debug("檢測到收斂，降低控制強度")
+        
+        # 2. 距離因子 - 距離越近越謹慎
+        if distance < 2.0:
+            distance_factor = distance / 2.0
+            control_factor *= distance_factor
+        
+        # 3. 角度因子 - 小角度誤差時更謹慎
+        angle_abs = abs(current_angle)
+        if angle_abs < 15:
+            angle_factor = 0.6  # 小角度時降低強度
+            control_factor *= angle_factor
+        
+        # 4. 角速度因子 - 如果轉向速度過快，減少控制
+        angular_velocity = self.calculate_angular_velocity()
+        if abs(angular_velocity) > 20:  # 角速度超過20度/秒
+            velocity_factor = 0.4
+            control_factor *= velocity_factor
+            logger.debug(f"高角速度檢測: {angular_velocity:.2f}°/s，降低控制強度")
+        
+        # 5. 預測因子 - 如果預測角度比當前角度小，說明在改善
+        predicted_angle = self.predict_future_angle()
+        if abs(predicted_angle) < abs(current_angle) * 0.8:
+            prediction_factor = 0.7
+            control_factor *= prediction_factor
+            logger.debug("預測顯示角度正在改善，降低控制強度")
+        
+        # 限制控制因子範圍
+        control_factor = max(0.1, min(1.0, control_factor))
+        
+        return control_factor
+
+class AdaptiveKalmanFilter:
+    """適應性卡爾曼濾波器 - 專門處理角度濾波"""
+    
+    def __init__(self, initial_angle=0.0):
+        # 狀態向量 [角度, 角速度]
+        self.x = np.array([initial_angle, 0.0])
+        
+        # 狀態協方差矩陣
+        self.P = np.array([[1.0, 0.0],
+                          [0.0, 1.0]])
+        
+        # 狀態轉移矩陣 (dt會在predict時更新)
+        self.F = np.array([[1.0, 0.0],
+                          [0.0, 1.0]])
+        
+        # 觀測矩陣 (只觀測角度)
+        self.H = np.array([[1.0, 0.0]])
+        
+        # 過程噪聲協方差
+        self.Q = np.array([[0.1, 0.0],
+                          [0.0, 0.5]])
+        
+        # 基礎觀測噪聲協方差
+        self.R_base = np.array([[1.0]])
+        self.R = self.R_base.copy()
+        
+        # 用於檢測突變的參數
+        self.angle_history = deque(maxlen=5)
+        self.last_angle = initial_angle
+        self.innovation_threshold = 15.0  # 角度突變檢測閾值
+        
+    def normalize_angle(self, angle):
+        """正規化角度到[-90, 90]範圍"""
+        while angle > 90:
+            angle -= 180
+        while angle < -90:
+            angle += 180
+        return angle
+    
+    def detect_angle_jump(self, measured_angle):
+        """檢測角度突變"""
+        if len(self.angle_history) < 2:
+            return False
+        
+        # 計算與歷史角度的差異
+        recent_angles = list(self.angle_history)[-3:]
+        avg_recent = np.mean(recent_angles)
+        
+        # 檢查是否有大幅度突變
+        angle_diff = abs(measured_angle - avg_recent)
+        
+        return angle_diff > self.innovation_threshold
+    
+    def predict(self, dt):
+        """預測步驟"""
+        # 更新狀態轉移矩陣
+        self.F[0, 1] = dt
+        
+        # 預測狀態
+        self.x = self.F @ self.x
+        
+        # 正規化角度
+        self.x[0] = self.normalize_angle(self.x[0])
+        
+        # 更新過程噪聲協方差 (根據時間間隔調整)
+        Q_scaled = self.Q * dt
+        
+        # 預測協方差
+        self.P = self.F @ self.P @ self.F.T + Q_scaled
+    
+    def update(self, measured_angle):
+        """更新步驟"""
+        # 正規化測量角度
+        measured_angle = self.normalize_angle(measured_angle)
+        
+        # 檢測角度突變
+        is_jump = self.detect_angle_jump(measured_angle)
+        
+        # 根據是否突變調整觀測噪聲
+        if is_jump:
+            # 突變時增加信任度，降低噪聲
+            self.R = self.R_base * 0.3
+            logger.debug(f"檢測到角度突變: {measured_angle:.2f}°")
+        else:
+            # 正常情況下使用標準噪聲
+            self.R = self.R_base.copy()
+        
+        # 計算卡爾曼增益
+        innovation_cov = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(innovation_cov)
+        
+        # 計算創新 (innovation)
+        predicted_measurement = self.H @ self.x
+        innovation = measured_angle - predicted_measurement[0]
+        
+        # 處理角度跨越問題
+        if innovation > 90:
+            innovation -= 180
+        elif innovation < -90:
+            innovation += 180
+        
+        # 更新狀態
+        self.x = self.x + K.flatten() * innovation
+        
+        # 正規化角度
+        self.x[0] = self.normalize_angle(self.x[0])
+        
+        # 更新協方差
+        I = np.eye(2)
+        self.P = (I - K @ self.H) @ self.P
+        
+        # 更新歷史記錄
+        self.angle_history.append(measured_angle)
+        self.last_angle = measured_angle
+        
+        return self.x[0]  # 返回濾波後的角度
+
+class AdaptiveSpeedController:
+    """自適應速度控制器 - 整合預測控制和動態調整"""
+    
+    def __init__(self):
+        # 基礎控制間隔
+        self.base_forward_levels = {
+            'slow': 0.08,
+            'medium': 0.05,
+            'fast': 0.02
+        }
+        
+        self.base_turn_levels = {
+            'fine': 0.15,       # 增加基礎間隔，讓轉向更平滑
+            'normal': 0.08,
+            'aggressive': 0.05
+        }
+        
+        # 整合預測控制器
+        self.predictive_controller = PredictiveController()
+        
+        # 平滑控制歷史
+        self.last_control_factors = deque(maxlen=3)
+        
+    def update_measurement(self, angle, distance, timestamp):
+        """更新測量數據到預測控制器"""
+        self.predictive_controller.add_measurement(angle, distance, timestamp)
+    
+    def get_forward_interval(self, distance, control_factor=1.0):
+        """根據距離和控制因子獲取前進間隔"""
+        if distance >= 2.5:
+            base_interval = self.base_forward_levels['fast']
+        elif distance > 1.5:
+            base_interval = self.base_forward_levels['slow']
+        else:
+            return None
+        
+        # 應用控制因子
+        adjusted_interval = base_interval / control_factor
+        return max(base_interval, adjusted_interval)
+    
+    def get_turn_interval(self, angle, distance):
+        """根據角度、距離和預測控制獲取轉彎間隔"""
+        angle_abs = abs(angle)
+        
+        # 計算控制因子
+        control_factor = self.predictive_controller.calculate_control_factor(angle, distance)
+        
+        # 平滑控制因子
+        self.last_control_factors.append(control_factor)
+        if len(self.last_control_factors) >= 2:
+            smoothed_factor = np.mean(list(self.last_control_factors))
+        else:
+            smoothed_factor = control_factor
+        
+        # 根據角度選擇基礎間隔
+        if angle_abs >= 45:
+            base_interval = self.base_turn_levels['aggressive']
+        elif angle_abs >= 20:
+            base_interval = self.base_turn_levels['normal']
+        else:
+            base_interval = self.base_turn_levels['fine']
+        
+        # 應用平滑後的控制因子
+        # 控制因子越小，間隔越大（轉向越慢）
+        adjusted_interval = base_interval / smoothed_factor
+        
+        # 限制最大間隔，避免控制過慢
+        max_interval = base_interval * 3.0
+        final_interval = min(adjusted_interval, max_interval)
+        
+        logger.debug(f"轉向控制: 角度={angle:.2f}°, 基礎間隔={base_interval:.3f}s, "
+                    f"控制因子={smoothed_factor:.3f}, 最終間隔={final_interval:.3f}s")
+        
+        return final_interval
+
+class UWBReader:
+    def __init__(self, port: str = '/dev/ttyS0', baud_rate: int = 115200):
+        """
+        初始化UWB讀取器
+        
+        Args:
+            port: 串口裝置名稱
+            baud_rate: 鮑率
+        """
+        self.PI = 3.14159265359
+        self.latest_data = None
+        self.running = True
+        self.last_data_time = 0 
+        self.data_lock = threading.Lock()
+        
+        # 添加濾波器
+        self.angle_filter = AdaptiveKalmanFilter(initial_angle=0.0)
+        self.last_filter_time = time.time()
+        
+        # 初始化串口
+        try:
+            self.serial = serial.Serial(
+                port=port,
+                baudrate=baud_rate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=1
+            )
+            logger.info(f"UWB 讀取器初始化成功，連接到 {port}")
+        except Exception as e:
+            logger.error(f"UWB 讀取器初始化失敗: {str(e)}")
+            self.serial = None
+        
+    def process_valid_data(self, data: bytes) -> dict:
+        """處理有效的UWB數據包"""
+        # 提取地址(第4、5個字節)
+        address = (data[3] << 8) | data[4]
+        
+        # 提取角度和距離數據
+        raw_angle = data[5]
+        raw_distance = (
+            data[9] |
+            (data[10] << 8) |
+            (data[11] << 16) |
+            (data[12] << 24)
+        )
+        
+        # 計算實際距離
+        real_distance = raw_distance / 100
+        
+        # 確定實際角度
+        if (data[6] == 0xFF and data[7] == 0xFF and data[8] == 0xFF):
+            raw_real_angle = 255 - raw_angle
+        elif (data[6] == 0x00 and data[7] == 0x00 and data[8] == 0x00):
+            raw_real_angle = 0 - raw_angle
+        else:
+            return None
+        
+        # 應用卡爾曼濾波
+        current_time = time.time()
+        dt = current_time - self.last_filter_time
+        self.last_filter_time = current_time
+        
+        # 濾波處理
+        self.angle_filter.predict(dt)
+        filtered_angle = self.angle_filter.update(raw_real_angle)
+        
+        result = {
+            'address': hex(address),
+            'angle': filtered_angle,           # 濾波後的角度
+            'raw_angle': raw_real_angle,       # 原始角度
+            'distance': real_distance,
+            'timestamp': current_time
+        }
+        
+        # 線程安全地更新數據
+        with self.data_lock:
+            self.latest_data = result
+            self.last_data_time = current_time
+            
+        logger.debug(f"角度濾波: 原始={raw_real_angle:.2f}° -> 濾波={filtered_angle:.2f}°")
+        return result
+
+    def read_data_thread(self):
+        """持續讀取並處理UWB數據的線程"""
+        if self.serial is None:
+            logger.error("無法啟動UWB讀取，串口未初始化")
+            return
+            
+        try:
+            while self.running:
+                # 檢查是否有足夠的數據可讀
+                if self.serial.in_waiting >= 31:
+                    # 讀取31字節的數據包
+                    data = self.serial.read(31)
+                    
+                    # 驗證數據包的起始和結束標記
+                    if data[0] == 0x2A and data[30] == 0x23:
+                        result = self.process_valid_data(data)
+                        if result:
+                            logger.debug(f"UWB數據: 角度={result['angle']:.2f}°, 距離={result['distance']:.2f}m")
+                    else:
+                        # 無效數據包，讀取下一個字節
+                        self.serial.read(1)
+                time.sleep(0.01)  # 短暫延時避免CPU佔用過高
+                
+        except Exception as e:
+            logger.error(f"UWB讀取發生錯誤: {e}")
+        finally:
+            if self.serial and self.serial.is_open:
+                self.serial.close()
+
+    def start_reading(self):
+        """啟動讀取線程"""
+        if self.serial is None:
+            return False
+        
+        self.thread = threading.Thread(target=self.read_data_thread, daemon=True)
+        self.thread.start()
+        logger.info("UWB讀取線程已啟動")
+        return True
+
+    def stop_reading(self):
+        """停止讀取線程"""
+        self.running = False
+        if hasattr(self, 'thread'):
+            self.thread.join(timeout=2)
+        logger.info("UWB讀取線程已停止")
+
+    def get_latest_data(self):
+        """獲取最新的UWB數據（線程安全）"""
+        with self.data_lock:
+            return self.latest_data.copy() if self.latest_data else None
+
+    def is_data_fresh(self, timeout=1.0):
+        """檢查數據是否新鮮（在超時時間內）"""
+        with self.data_lock:
+            if self.last_data_time == 0:
+                return False
+            return (time.time() - self.last_data_time) <= timeout
+
+
+class MotorController:
+    def __init__(self):
+        """初始化馬達控制器"""
+        # GPIO 按鈕控制腳位
+        self.FORWARD_PIN = 18
+        self.LEFT_PIN = 23
+        self.RIGHT_PIN = 24
+        self.STOP_PIN = 25
+        
+        # 分別追蹤前進、左轉、右轉的時間
+        self.last_forward_time = 0
+        self.last_left_time = 0
+        self.last_right_time = 0
+        
+        # 使用自適應速度控制器
+        self.speed_controller = AdaptiveSpeedController()
+        
+        self.setup_gpio()
+
+    def setup_gpio(self):
+        """初始化GPIO設定"""
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        
+        # 設置GPIO按鈕控制腳位為輸出
+        GPIO.setup(self.FORWARD_PIN, GPIO.OUT)
+        GPIO.setup(self.LEFT_PIN, GPIO.OUT)
+        GPIO.setup(self.RIGHT_PIN, GPIO.OUT)
+        GPIO.setup(self.STOP_PIN, GPIO.OUT)
+        
+        # 初始狀態設為LOW
+        GPIO.output(self.FORWARD_PIN, GPIO.LOW)
+        GPIO.output(self.LEFT_PIN, GPIO.LOW)
+        GPIO.output(self.RIGHT_PIN, GPIO.LOW)
+        GPIO.output(self.STOP_PIN, GPIO.LOW)
+        
+        logger.info("GPIO設定完成")
+
+    def trigger_button(self, pin, duration=0.1):
+        """觸發按鈕的函數（模擬按下按鈕）"""
+        GPIO.output(pin, GPIO.HIGH)
+        time.sleep(duration)
+        GPIO.output(pin, GPIO.LOW)
+
+    def forward_pulse(self, duration=0.05):
+        """前進脈衝"""
+        logger.debug("前進脈衝")
+        self.trigger_button(self.FORWARD_PIN, duration)
+
+    def left_pulse(self, duration=0.05):
+        """左轉脈衝"""
+        logger.debug("左轉脈衝")
+        self.trigger_button(self.LEFT_PIN, duration)
+
+    def right_pulse(self, duration=0.05):
+        """右轉脈衝"""
+        logger.debug("右轉脈衝")
+        self.trigger_button(self.RIGHT_PIN, duration)
+
+    def stop(self):
+        """停下"""
+        logger.debug("停下")
+        self.trigger_button(self.STOP_PIN)
+
+    def control_motors(self, angle, distance, timestamp):
+        """根據角度和距離控制馬達（整合預測控制）"""
+        # 更新預測控制器的測量數據
+        self.speed_controller.update_measurement(angle, distance, timestamp)
+        
+        current_time = time.time()
+        angle_abs = abs(angle)
+            
+        logger.info(f"控制指令 - 角度: {angle:.2f}°, 距離: {distance:.2f}m")
+        
+        # 根據距離和角度決定動作
+        if distance >= 2.5:
+            # 距離大於2.5m
+            if angle > 12:  # 降低轉彎觸發閾值，但使用智慧控制
+                # 需要右轉 - 使用預測控制
+                turn_interval = self.speed_controller.get_turn_interval(angle, distance)
+                if current_time - self.last_right_time >= turn_interval:
+                    self.right_pulse(0.05)
+                    self.last_right_time = current_time
+            elif angle < -12:
+                # 需要左轉 - 使用預測控制
+                turn_interval = self.speed_controller.get_turn_interval(-angle, distance)
+                if current_time - self.last_left_time >= turn_interval:
+                    self.left_pulse(0.05)
+                    self.last_left_time = current_time
+            else:
+                # 前進
+                control_factor = self.speed_controller.predictive_controller.calculate_control_factor(angle, distance)
+                forward_interval = self.speed_controller.get_forward_interval(distance, control_factor)
+                if forward_interval and current_time - self.last_forward_time >= forward_interval:
+                    self.forward_pulse(0.05)
+                    self.last_forward_time = current_time
+
+        elif distance <= 1.5:
+            # 距離小於1.5m - 立即停止
+            self.stop()
+
+        else:
+            # 1.5m < 距離 < 2.5m - 謹慎模式，使用預測控制
+            if angle > 10:  # 降低轉彎觸發閾值
+                # 需要右轉
+                turn_interval = self.speed_controller.get_turn_interval(angle, distance)
+                if current_time - self.last_right_time >= turn_interval:
+                    self.right_pulse(0.06)
+                    self.last_right_time = current_time
+            elif angle < -10:
+                # 需要左轉
+                turn_interval = self.speed_controller.get_turn_interval(-angle, distance)
+                if current_time - self.last_left_time >= turn_interval:
+                    self.left_pulse(0.06)
+                    self.last_left_time = current_time
+            else:
+                # 謹慎前進
+                control_factor = self.speed_controller.predictive_controller.calculate_control_factor(angle, distance)
+                forward_interval = self.speed_controller.get_forward_interval(distance, control_factor)
+                if forward_interval and current_time - self.last_forward_time >= forward_interval:
+                    self.forward_pulse(0.06)
+                    self.last_forward_time = current_time
+
+    def cleanup(self):
+        """清理GPIO資源"""
+        GPIO.cleanup()
+        logger.info("GPIO資源清理完成")
+
+
+def main():
+    """主函數"""
+    logger.info("初始化系統...")
+    
+    # 初始化UWB讀取器和馬達控制器
+    uwb_reader = UWBReader('/dev/ttyS0', 115200)
+    motor_controller = MotorController()
+    
+    # 啟動UWB讀取線程
+    if not uwb_reader.start_reading():
+        logger.error("無法啟動UWB讀取器")
+        return
+    
+    logger.info("系統初始化完成，開始運行...")
+    logger.info("卡爾曼濾波器已啟用 - 角度突變檢測閾值: 15°")
+    logger.info("預測控制系統已啟用 - 延遲補償和過度轉向防護")
+    
+    try:
+        while True:
+            # 檢查是否有新的UWB數據
+            if uwb_reader.is_data_fresh(timeout=1.0):
+                data = uwb_reader.get_latest_data()
+                if data:
+                    # 使用濾波後的角度和距離數據控制馬達，包含時間戳
+                    motor_controller.control_motors(data['angle'], data['distance'], data['timestamp'])
+            else:
+                # 數據超時，停止馬達
+                motor_controller.stop()
+                logger.warning("UWB數據超時 - 停止馬達")
+            
+            # 主循環延遲
+            time.sleep(0.1)
+            
+    except KeyboardInterrupt:
+        logger.info("程式被用戶中斷")
+    except Exception as e:
+        logger.error(f"程式執行錯誤: {e}")
+    finally:
+        # 清理資源
+        uwb_reader.stop_reading()
+        motor_controller.cleanup()
+        logger.info("程式結束，資源清理完成")
+
+
+if __name__ == "__main__":
+    main()
